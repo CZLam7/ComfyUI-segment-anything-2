@@ -1,6 +1,11 @@
 import torch
 from torch.functional import F
 import os
+
+import sys, os
+# Force Python to look in your plugin folder first
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+
 import numpy as np
 import json
 import random
@@ -13,9 +18,88 @@ from .load_model import load_model
 import comfy.model_management as mm
 from comfy.utils import ProgressBar, common_upscale
 import folder_paths
+import os, folder_paths
+from sam2.sam2_image_predictor import SAM2ImagePredictor
+from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
+from PIL import Image
+
+import sam2
+import inspect
+print(f"[DEBUG] sam2 package path: {sam2.__file__}")      # path to sam2/__init__.py
+print(f"[DEBUG] sam2_image_predictor path: {inspect.getfile(SAM2ImagePredictor)}")
+
 
 script_directory = os.path.dirname(os.path.abspath(__file__))
 
+MPS_AVAILABLE = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+
+FT_DIR = os.path.join(folder_paths.models_dir, "sam2", "finetunes")
+STATE_DICT_CHOICES = [""] + [
+    f for f in os.listdir(FT_DIR)
+    if f.lower().endswith((".torch", ".pth", ".safetensors"))
+]
+
+class LoadFinetunedSAM2:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "variant":    ([
+                    "sam2-hiera-base-plus",
+                    "sam2-hiera-large",
+                    "sam2.1-hiera-base-plus",
+                    "sam2.1-hiera-large",
+                ],),
+                "device":     (["cuda","cpu","mps"],),
+                "precision":  (["fp16","bf16","fp32"], {"default":"fp32"}),
+            },
+            "optional": {
+                "state_dict": (STATE_DICT_CHOICES, {"default": ""}),
+            }
+        }
+
+    RETURN_TYPES = ("SAM2PREDICTOR",)
+    RETURN_NAMES = ("predictor",)
+    FUNCTION     = "load"
+    CATEGORY     = "SAM2"
+
+    def load(self, variant, device, precision, state_dict):
+        # Handle unsupported 'cuda' on non-CUDA build
+        if device == 'cuda' and not torch.cuda.is_available():
+            if MPS_AVAILABLE:
+                print("[LoadFinetunedSAM2] CUDA not available, falling back to MPS")
+                torch_device = torch.device('mps')
+            else:
+                print("[LoadFinetunedSAM2] CUDA not available, falling back to CPU")
+                torch_device = torch.device('cpu')
+        else:
+            torch_device = torch.device(device)
+
+        # 1) Device & dtype
+        dtype_map = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}
+        dtype = dtype_map[precision]
+
+        # 2) Instantiate the official predictor
+        inst_device = str(torch_device)
+        predictor = SAM2ImagePredictor.from_pretrained(
+            f"facebook/{variant}",
+            device=inst_device
+        )
+        predictor.model = predictor.model.to(torch_device).to(dtype).eval()
+
+        # 3) Load your finetuned weights
+        if state_dict:
+            ckpt_path = state_dict
+            if not os.path.isabs(ckpt_path):
+                ckpt_path = os.path.join(FT_DIR, state_dict)
+            if os.path.isfile(ckpt_path):
+                sd = torch.load(ckpt_path, map_location=torch_device)
+                predictor.model.load_state_dict(sd)
+            else:
+                print(f"[LoadFinetunedSAM2] WARNING: checkpoint not found at {ckpt_path}")
+
+        return (predictor,)
+    
 class DownloadAndLoadSAM2Model:
     @classmethod
     def INPUT_TYPES(s):
@@ -38,16 +122,20 @@ class DownloadAndLoadSAM2Model:
                     {
                     "default": 'fp16'
                     }),
-
             },
+            "optional": {
+                "state_dict": (STATE_DICT_CHOICES, {"default": ""}),
+            }
         }
+    
+
 
     RETURN_TYPES = ("SAM2MODEL",)
     RETURN_NAMES = ("sam2_model",)
     FUNCTION = "loadmodel"
     CATEGORY = "SAM2"
 
-    def loadmodel(self, model, segmentor, device, precision):
+    def loadmodel(self, model, segmentor, device, precision, state_dict=""):
         if precision != 'fp32' and device == 'cpu':
             raise ValueError("fp16 and bf16 are not supported on cpu")
 
@@ -98,7 +186,24 @@ class DownloadAndLoadSAM2Model:
         print(f"Using model config: {model_cfg_path}")
 
         model = load_model(model_path, model_cfg_path, segmentor, dtype, device)
-        
+
+        if state_dict:
+            ckpt_path = os.path.expanduser(state_dict)
+            if os.path.isabs(state_dict) and os.path.isfile(state_dict):
+                ckpt_path = state_dict
+            else:
+                # Otherwise assume it's in our finetunes dir
+                ckpt_path = os.path.join(FT_DIR, state_dict)
+
+            if os.path.isfile(ckpt_path):
+                print(f"Loading fine-tuned weights from: {ckpt_path}")
+                sd = torch.load(ckpt_path, map_location=device)
+                # if isinstance(sd, dict) and "model_state_dict" in sd:
+                #     sd = sd["model_state_dict"]
+                model.model.load_state_dict(sd, strict=False)
+            else:
+                print(f"Warning: state_dict file not found at {ckpt_path}")
+
         sam2_model = {
             'model': model, 
             'dtype': dtype,
@@ -108,7 +213,6 @@ class DownloadAndLoadSAM2Model:
             }
 
         return (sam2_model,)
-
 
 class Florence2toCoordinates:
     @classmethod
@@ -185,6 +289,7 @@ class Sam2Segmentation:
                 "keep_model_loaded": ("BOOLEAN", {"default": True}),
             },
             "optional": {
+                "text_prompt":          ("STRING", {"default": ""}),
                 "coordinates_positive": ("STRING", {"forceInput": True}),
                 "coordinates_negative": ("STRING", {"forceInput": True}),
                 "bboxes": ("BBOX", ),
@@ -200,13 +305,37 @@ class Sam2Segmentation:
     CATEGORY = "SAM2"
 
     def segment(self, image, sam2_model, keep_model_loaded, coordinates_positive=None, coordinates_negative=None, 
-                individual_objects=False, bboxes=None, mask=None):
+                individual_objects=False, bboxes=None, mask=None, text_prompt=None):
         offload_device = mm.unet_offload_device()
         model = sam2_model["model"]
         device = sam2_model["device"]
         dtype = sam2_model["dtype"]
         segmentor = sam2_model["segmentor"]
         B, H, W, C = image.shape
+
+        if text_prompt:
+            processor = AutoProcessor.from_pretrained("IDEA-Research/grounding-dino-base")
+            detector  = AutoModelForZeroShotObjectDetection.from_pretrained(
+                            "IDEA-Research/grounding-dino-base"
+                        ).to(device)
+            # squeeze image array from 4d to 3d
+            arr = image.numpy() 
+            arr = np.squeeze(arr)       
+            if arr.ndim != 3:
+                raise ValueError(f"Unexpected image shape after squeeze: {arr.shape}")
+            # convert to uint8 and PIL
+            pil = Image.fromarray((arr * 255).astype(np.uint8))
+            inputs = processor(images=pil, text=[text_prompt], return_tensors="pt").to(device)
+            with torch.no_grad():
+                out = detector(**inputs)
+            res = processor.post_process_grounded_object_detection(
+                    out, inputs.input_ids,
+                    box_threshold=0.3, text_threshold=0.25,
+                    target_sizes=[image.shape[:2]]
+                )[0]
+            boxes  = res["boxes"].cpu().numpy()
+            scores = res["scores"].cpu().numpy()
+            bboxes = boxes[scores >= 0.3].tolist()
         
         if mask is not None:
             input_mask = mask.clone().unsqueeze(1)
@@ -707,6 +836,84 @@ class Sam2AutoSegmentation:
         mask_tensor = torch.stack(out_list, dim=0)
         return (mask_tensor.cpu().float(), segment_image_tensor.cpu().float(), bbox_list)
 
+class SAM2SkinMaskNode:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "predictor":  ("SAM2PREDICTOR",),  # a SAM2ImagePredictor
+                "image":      ("IMAGE",),          # H×W×3 float in [0,1]
+                "num_points": ("INT",{"default":30,"min":1,"max":200}),
+            }
+        }
+
+    # We only emit an IMAGE so it can drive PreviewImage directly
+    RETURN_TYPES  = ("IMAGE",)
+    RETURN_NAMES  = ("mask_image",)
+    FUNCTION      = "generate_mask"
+    CATEGORY      = "SAM2"
+
+    def sample_points(self, mask, num_pts):
+        ys, xs = np.where(mask > 0)
+        if len(xs) == 0:
+            return np.zeros((0,1,2), dtype=int)
+        idxs = np.random.choice(len(xs), size=min(num_pts, len(xs)), replace=False)
+        pts = np.stack([xs[idxs], ys[idxs]], axis=1)
+        return pts.reshape(-1,1,2)
+
+    def generate_mask(self, predictor, image, num_points):
+        """
+        predictor: SAM2ImagePredictor (already .to(device).eval() with your finetuned weights)
+        image:     H×W×3 float32 tensor in [0,1]
+        num_points: how many random points to sample over the full image
+        """
+        # ── Prepare image for SAM2 ──────────────────────────────────────────────
+        # ComfyUI IMAGE is H×W×3 float in [0,1], convert back to uint8 for SAM2ImagePredictor
+        if image.ndim == 4:
+            image = image[0]
+        img_np = (image.numpy() * 255).astype(np.uint8)
+        # ────────────────────────────────────────────────────────────────────────
+
+        predictor: SAM2ImagePredictor
+        predictor.set_image(img_np)
+
+        # sample points over full image
+        full_mask = np.ones(img_np.shape[:2], dtype=np.uint8)
+        pts    = self.sample_points(full_mask, num_points)
+        labels = np.ones((pts.shape[0],1), dtype=int)
+
+        # run inference
+        with torch.no_grad():
+            masks, scores, _ = predictor.predict(
+                point_coords=pts,
+                point_labels=labels
+            )
+
+        # boolean masks & sort by score desc
+        masks = masks[:,0].astype(bool)
+        order = np.argsort(scores[:,0])[::-1]
+        masks = masks[order]
+
+        # merge into one binary mask
+        combined = np.zeros_like(masks[0], dtype=np.uint8)
+        occupied = np.zeros_like(combined, dtype=bool)
+        for m in masks:
+            if m.sum() == 0:
+                continue
+            # skip if too much overlap
+            if (m & occupied).sum() / m.sum() > 0.15:
+                continue
+            m[occupied] = False
+            combined[m] = 255
+            occupied |= m
+
+        # stack to 3-channel RGB and convert to float [0,1]
+        mask_rgb   = np.stack([combined]*3, axis=-1)
+        mask_tensor = torch.from_numpy(mask_rgb).float().div(255.0)  
+        mask_out = mask_tensor.unsqueeze(0)
+
+        return (mask_out,)
+
 #WIP    
 # class OwlV2Detector:
 #     @classmethod
@@ -750,18 +957,22 @@ class Sam2AutoSegmentation:
 #         return (mask_tensor,)
      
 NODE_CLASS_MAPPINGS = {
+    "LoadFinetunedSAM2": LoadFinetunedSAM2,
     "DownloadAndLoadSAM2Model": DownloadAndLoadSAM2Model,
     "Sam2Segmentation": Sam2Segmentation,
     "Florence2toCoordinates": Florence2toCoordinates,
     "Sam2AutoSegmentation": Sam2AutoSegmentation,
     "Sam2VideoSegmentationAddPoints": Sam2VideoSegmentationAddPoints,
-    "Sam2VideoSegmentation": Sam2VideoSegmentation
+    "Sam2VideoSegmentation": Sam2VideoSegmentation,
+    "SAM2SkinMaskNode": SAM2SkinMaskNode,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "LoadFinetunedSAM2": "Load Fine-tuned SAM2",
     "DownloadAndLoadSAM2Model": "(Down)Load SAM2Model",
     "Sam2Segmentation": "Sam2Segmentation",
     "Florence2toCoordinates": "Florence2 Coordinates",
     "Sam2AutoSegmentation": "Sam2AutoSegmentation",
     "Sam2VideoSegmentationAddPoints": "Sam2VideoSegmentationAddPoints",
-    "Sam2VideoSegmentation": "Sam2VideoSegmentation"
+    "Sam2VideoSegmentation": "Sam2VideoSegmentation",
+    "SAM2SkinMaskNode": "SAM2 → Skin Mask",
 }
