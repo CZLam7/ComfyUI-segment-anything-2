@@ -33,7 +33,7 @@ script_directory = os.path.dirname(os.path.abspath(__file__))
 
 MPS_AVAILABLE = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
 
-FT_DIR = os.path.join(folder_paths.models_dir, "sam2", "finetunes")
+FT_DIR = os.path.join(folder_paths.models_dir, "sams", "finetunes")
 STATE_DICT_CHOICES = [""] + [
     f for f in os.listdir(FT_DIR)
     if f.lower().endswith((".torch", ".pth", ".safetensors"))
