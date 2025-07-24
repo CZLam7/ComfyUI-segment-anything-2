@@ -289,7 +289,6 @@ class Sam2Segmentation:
                 "keep_model_loaded": ("BOOLEAN", {"default": True}),
             },
             "optional": {
-                "text_prompt":          ("STRING", {"default": ""}),
                 "coordinates_positive": ("STRING", {"forceInput": True}),
                 "coordinates_negative": ("STRING", {"forceInput": True}),
                 "bboxes": ("BBOX", ),
@@ -305,37 +304,13 @@ class Sam2Segmentation:
     CATEGORY = "SAM2"
 
     def segment(self, image, sam2_model, keep_model_loaded, coordinates_positive=None, coordinates_negative=None, 
-                individual_objects=False, bboxes=None, mask=None, text_prompt=None):
+                individual_objects=False, bboxes=None, mask=None):
         offload_device = mm.unet_offload_device()
         model = sam2_model["model"]
         device = sam2_model["device"]
         dtype = sam2_model["dtype"]
         segmentor = sam2_model["segmentor"]
         B, H, W, C = image.shape
-
-        if text_prompt:
-            processor = AutoProcessor.from_pretrained("IDEA-Research/grounding-dino-base")
-            detector  = AutoModelForZeroShotObjectDetection.from_pretrained(
-                            "IDEA-Research/grounding-dino-base"
-                        ).to(device)
-            # squeeze image array from 4d to 3d
-            arr = image.numpy() 
-            arr = np.squeeze(arr)       
-            if arr.ndim != 3:
-                raise ValueError(f"Unexpected image shape after squeeze: {arr.shape}")
-            # convert to uint8 and PIL
-            pil = Image.fromarray((arr * 255).astype(np.uint8))
-            inputs = processor(images=pil, text=[text_prompt], return_tensors="pt").to(device)
-            with torch.no_grad():
-                out = detector(**inputs)
-            res = processor.post_process_grounded_object_detection(
-                    out, inputs.input_ids,
-                    box_threshold=0.3, text_threshold=0.25,
-                    target_sizes=[image.shape[:2]]
-                )[0]
-            boxes  = res["boxes"].cpu().numpy()
-            scores = res["scores"].cpu().numpy()
-            bboxes = boxes[scores >= 0.3].tolist()
         
         if mask is not None:
             input_mask = mask.clone().unsqueeze(1)
