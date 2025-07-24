@@ -114,10 +114,9 @@ class GroundingDINOPredict:
 
         # set device
         torch_device = torch.device(device if device != 'cuda' else 'cuda')
-        mm.set_torch_device(str(torch_device))
 
         # load and predict
-        dino = load_groundingdino_model(model_name)
+        dino = load_groundingdino_model(model_name).to(torch_device)
         boxes = groundingdino_predict(dino, pil, prompt, threshold)
         return (boxes,)
 
